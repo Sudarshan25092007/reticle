@@ -11,7 +11,8 @@
  */
 
 /** The minimal page surface the pool drives. Real Playwright `Page` satisfies this. */
-import { unreachableUrlIn } from '@reticlehq/core';
+import { unreachableUrlIn, type SeedStorage } from '@reticlehq/core';
+import { seedStorageInto } from './storage-seed.js';
 
 export interface PooledPage {
   goto(url: string, opts?: { timeoutMs?: number }): Promise<unknown>;
@@ -37,6 +38,11 @@ export interface PooledPage {
    * reports dispatched/settled while the styles never ran.
    */
   hover?(x: number, y: number): Promise<void>;
+  /** Add an init script to run after document creation but before any page scripts run. */
+  addInitScript?<Arg>(
+    script: ((arg: Arg) => void) | string,
+    arg?: Arg,
+  ): Promise<InitScriptHandle | void>;
   /**
    * Install (or clear) network mocks on this page. OPTIONAL: a fake that does not implement it
    * makes `reticle_network_mock` refuse rather than claiming it stubbed a request it cannot intercept.
@@ -61,6 +67,22 @@ export interface PooledDialog {
   dismiss(): Promise<void>;
 }
 
+export interface InitScriptHandle {
+  dispose(): Promise<void>;
+}
+
+export interface PooledCookie {
+  name: string;
+  value: string;
+  url?: string;
+  domain?: string;
+  path?: string;
+  expires?: number;
+  httpOnly?: boolean;
+  secure?: boolean;
+  sameSite?: 'Strict' | 'Lax' | 'None';
+}
+
 /**
  * One interception rule the pool can install. Same fields as the drive-path mock rule, kept here so
  * the pool does not import Playwright.
@@ -79,6 +101,7 @@ export interface PooledMockRule {
 export interface PooledContext {
   newPage(): Promise<PooledPage>;
   close(): Promise<void>;
+  addCookies?(cookies: PooledCookie[]): Promise<void>;
 }
 
 /** The launched browser. Real Playwright `Browser` satisfies this. */
@@ -407,7 +430,7 @@ export class BrowserPool {
    */
   async acquire(
     url: string,
-    opts: { signal?: AbortSignal; sessionId?: string } = {},
+    opts: { signal?: AbortSignal; sessionId?: string; seedStorage?: SeedStorage } = {},
   ): Promise<Lease> {
     if (this.#closed) throw new Error('browser pool is shut down');
     // #waitForSlot claims the slot synchronously (bumps #occupied) before returning, so the cap holds
@@ -445,7 +468,21 @@ export class BrowserPool {
         else pendingDialogMessage = dialog.message;
         void dialog.dismiss();
       });
-      await page.goto(url, { timeoutMs: this.#navTimeout });
+      let seedHandle: InitScriptHandle | undefined;
+      let checkSeedError: (() => void) | undefined;
+      if (opts.seedStorage !== undefined) {
+        const seedResult = await seedStorageInto(context, page, url, opts.seedStorage);
+        seedHandle = seedResult?.handle;
+        checkSeedError = seedResult?.checkError;
+      }
+      try {
+        await page.goto(url, { timeoutMs: this.#navTimeout });
+        checkSeedError?.();
+      } finally {
+        if (seedHandle !== undefined) {
+          await seedHandle.dispose().catch(() => undefined);
+        }
+      }
       // The browser can crash WHILE goto is resolving; #onCrash then clears #active and zeroes
       // #occupied. Registering the lease now would resurrect a dead entry against a crashed browser with
       // the slot count out of sync (drifting below #active.size, eventually exceeding the cap). If we're
