@@ -561,7 +561,6 @@ describe('BrowserPool', () => {
     await expect(acquiring).rejects.toThrow();
   });
 
-
   it('dismisses a native dialog on a leased page instead of leaving it blocked (#786)', async () => {
     const { launch, browsers } = fakeLauncher();
     const pool = new BrowserPool(launch, { maxContexts: 4, genSessionId: counterIds() });
@@ -636,6 +635,7 @@ describe('BrowserPool', () => {
     const lease = await pool.acquire('http://localhost:3000/no-dialog-support');
 
     expect(pool.lastDialogMessage(lease.sessionId)).toBeUndefined();
+  });
 
   it('seeds cookies, localStorage, and sessionStorage before page.goto and disposes init script immediately after', async () => {
     const { launch, browsers } = fakeLauncher();
@@ -733,6 +733,5 @@ describe('BrowserPool', () => {
       session: undefined,
       targetOrigin: 'http://localhost:3000',
     });
-
   });
 });

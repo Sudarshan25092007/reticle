@@ -78,10 +78,7 @@ export interface PredicateSession {
    * Optional: a fake that never throttles simply omits it.
    */
   throttled?(): boolean;
-  /**
-   * Set when a required application precondition (e.g. seedStorage) was not established.
-   * Optional: a fake that never tests preconditions simply omits it.
-   */
+  /** Precondition failure reason (e.g. seedStorage), if any. */
   preconditionFailure?(): string | undefined;
 }
 

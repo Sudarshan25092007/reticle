@@ -224,7 +224,9 @@ export function evaluateSeedPrecondition(
 
   // Clear redirect to an authentication/login endpoint when the requested URL was not a login page
   const isAuthPath = (pathname: string): boolean =>
-    /(?:^|\/)(?:login|signin|sign-in|auth\/login|auth\/signin|session\/new)(?:$|\/)/i.test(pathname);
+    /(?:^|\/)(?:login|signin|sign-in|auth\/login|auth\/signin|session\/new)(?:$|\/)/i.test(
+      pathname,
+    );
 
   if (!isAuthPath(reqParsed.pathname) && isAuthPath(actParsed.pathname)) {
     return `seeded authentication precondition not established: redirected from ${reqParsed.pathname} to login page (${actParsed.pathname})`;
@@ -360,10 +362,12 @@ export async function acquireLeasedSession(
   if (registeredId !== undefined) pool.alias?.(registeredId, lease.sessionId);
   const effectiveId = registeredId ?? lease.sessionId;
   if (seedStorage !== undefined) {
-    const session = sessions.get(effectiveId) as {
-      url?: string;
-      setPreconditionFailure?(reason: string): void;
-    } | undefined;
+    const session = sessions.get(effectiveId) as
+      | {
+          url?: string;
+          setPreconditionFailure?(reason: string): void;
+        }
+      | undefined;
     if (session?.setPreconditionFailure !== undefined) {
       const failureReason = evaluateSeedPrecondition(
         url,
@@ -489,9 +493,7 @@ export const LEASE_ACQUIRE_TOOL: ToolDef = {
           parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join(', '),
           seedStorageArg,
         );
-        throw new Error(
-          `reticle_lease{action:"acquire"} seedStorage is invalid: ${issuesMsg}`,
-        );
+        throw new Error(`reticle_lease{action:"acquire"} seedStorage is invalid: ${issuesMsg}`);
       }
       validatedSeed = parsed.data;
     }
