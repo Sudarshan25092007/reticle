@@ -22,9 +22,11 @@ import {
 } from '../session/lease-visibility.js';
 import { reticleStateHome } from '../daemon/daemon.js';
 import {
+  REDACTED_VALUE,
   RETICLE_URL_PARAM,
   RETICLE_DEFAULT_PORT,
   SeedStorageSchema,
+  scrubKnownSecrets,
   type SeedStorage,
 } from '@reticlehq/core';
 import { ReticleTool } from './tool-names.js';
@@ -104,13 +106,70 @@ export function appendReticleParams(url: string, session: string, projectId?: st
   }
 }
 
+function redactExactValue(text: string, value: string): string {
+  if (0 === value.length) return text;
+  const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return text.replace(
+    new RegExp(`(^|[^a-zA-Z0-9])${escaped}(?=$|[^a-zA-Z0-9])`, 'g'),
+    `$1${REDACTED_VALUE}`,
+  );
+}
+
+/**
+ * Scrub known secret shapes and raw seedStorage values (cookies, localStorage, sessionStorage)
+ * from an error string before it reaches daemon logs, metrics, or MCP error responses.
+ */
+export function scrubSeedFromError(text: string, seed?: unknown): string {
+  let out = scrubKnownSecrets(text);
+  if (undefined !== seed && null !== seed && 'object' === typeof seed) {
+    const s = seed as Record<string, unknown>;
+    const cookies = s['cookies'];
+    if (undefined !== cookies && null !== cookies) {
+      if (Array.isArray(cookies)) {
+        for (const c of cookies) {
+          if (undefined !== c && null !== c && 'object' === typeof c) {
+            const val = (c as Record<string, unknown>)['value'];
+            if (undefined !== val && 'string' === typeof val) {
+              out = redactExactValue(out, val);
+            }
+          }
+        }
+      } else if ('object' === typeof cookies) {
+        for (const v of Object.values(cookies as Record<string, unknown>)) {
+          if ('string' === typeof v) {
+            out = redactExactValue(out, v);
+          }
+        }
+      }
+    }
+    const local = s['local'];
+    if (undefined !== local && null !== local && 'object' === typeof local) {
+      for (const v of Object.values(local as Record<string, unknown>)) {
+        if ('string' === typeof v) {
+          out = redactExactValue(out, v);
+        }
+      }
+    }
+    const session = s['session'];
+    if (undefined !== session && null !== session && 'object' === typeof session) {
+      for (const v of Object.values(session as Record<string, unknown>)) {
+        if ('string' === typeof v) {
+          out = redactExactValue(out, v);
+        }
+      }
+    }
+  }
+  return out;
+}
+
 /**
  * Turn a raw navigation failure (Playwright's `page.goto: net::ERR_… at <url>\nCall log:…`, often
  * with ANSI codes) into a short, clean reason — so the agent/user sees "is the app running?" instead
  * of an internals-leaking wall of text.
  */
-export function cleanNavError(err: unknown): string {
-  const msg = err instanceof Error ? err.message : String(err);
+export function cleanNavError(err: unknown, seed?: SeedStorage): string {
+  const rawMsg = err instanceof Error ? err.message : String(err);
+  const msg = scrubSeedFromError(rawMsg, seed);
   // Strip ANSI color codes (ESC[…m) Playwright emits — built via fromCharCode to keep the
   // control character out of a regex literal (no-control-regex).
   const ansi = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g');
@@ -123,6 +182,55 @@ export function cleanNavError(err: unknown): string {
     .replace(/\s+at\s+https?:\/\/\S+.*$/, '')
     .trim()
     .slice(0, 100);
+}
+
+/**
+ * Determine if a required seedStorage application precondition failed.
+ *
+ * Checks strong signals:
+ * 1. HTTP 401/403 status on the initial navigation.
+ * 2. Cross-origin redirect when localStorage or sessionStorage was requested (skipped by origin-scoping).
+ * 3. Clear redirect to an authentication/login endpoint when the requested URL was not a login page.
+ *
+ * Normal app redirects (e.g. / → /dashboard) are valid and return undefined.
+ */
+export function evaluateSeedPrecondition(
+  requestedUrl: string,
+  actualUrl: string | undefined,
+  seed: SeedStorage,
+  navStatus?: number,
+): string | undefined {
+  if (401 === navStatus || 403 === navStatus) {
+    return `HTTP ${navStatus} returned on initial seeded navigation to ${requestedUrl}`;
+  }
+  if (actualUrl === undefined || '' === actualUrl.trim()) return undefined;
+
+  let reqParsed: URL | undefined;
+  let actParsed: URL | undefined;
+  try {
+    reqParsed = new URL(requestedUrl);
+    actParsed = new URL(actualUrl);
+  } catch {
+    return undefined;
+  }
+
+  // Cross-origin redirect when local or session storage was requested
+  const hasStorage =
+    (undefined !== seed.local && 0 < Object.keys(seed.local).length) ||
+    (undefined !== seed.session && 0 < Object.keys(seed.session).length);
+  if (hasStorage && reqParsed.origin !== actParsed.origin) {
+    return `seeded storage precondition not established: cross-origin redirect from ${reqParsed.origin} to ${actParsed.origin} skipped origin-scoped storage injection`;
+  }
+
+  // Clear redirect to an authentication/login endpoint when the requested URL was not a login page
+  const isAuthPath = (pathname: string): boolean =>
+    /(?:^|\/)(?:login|signin|sign-in|auth\/login|auth\/signin|session\/new)(?:$|\/)/i.test(pathname);
+
+  if (!isAuthPath(reqParsed.pathname) && isAuthPath(actParsed.pathname)) {
+    return `seeded authentication precondition not established: redirected from ${reqParsed.pathname} to login page (${actParsed.pathname})`;
+  }
+
+  return undefined;
 }
 
 /** A fresh, collision-resistant lease id. Uses crypto at the I/O boundary (not pure logic). */
@@ -215,7 +323,7 @@ export async function acquireLeasedSession(
     acquire: (
       url: string,
       opts: { sessionId: string; seedStorage?: SeedStorage },
-    ) => Promise<{ sessionId: string; release: () => Promise<void> }>;
+    ) => Promise<{ sessionId: string; release: () => Promise<void>; navStatus?: number }>;
     /**
      * The address this lease's page said it could not reach. Optional so a test double need not
      * implement it; the real pool always does.
@@ -230,10 +338,17 @@ export async function acquireLeasedSession(
   seedStorage?: SeedStorage,
 ): Promise<{ sessionId: string; release: () => Promise<void> }> {
   const sessionId = newLeaseId();
-  const lease = await pool.acquire(appendReticleParams(url, sessionId, projectId), {
-    sessionId,
-    ...(seedStorage !== undefined ? { seedStorage } : {}),
-  });
+  let lease;
+  try {
+    lease = await pool.acquire(appendReticleParams(url, sessionId, projectId), {
+      sessionId,
+      ...(seedStorage !== undefined ? { seedStorage } : {}),
+    });
+  } catch (err) {
+    throw new Error(
+      scrubSeedFromError(err instanceof Error ? err.message : String(err), seedStorage),
+    );
+  }
   // Resolved, not assumed — see resolveLeasedSessionId. The parallel suite replays against whatever
   // id comes back, so handing it the lease id for an app that named its own session sent every flow
   // in the run at a session that does not exist.
@@ -243,7 +358,25 @@ export async function acquireLeasedSession(
     return registeredId !== undefined;
   });
   if (registeredId !== undefined) pool.alias?.(registeredId, lease.sessionId);
-  return { sessionId: registeredId ?? lease.sessionId, release: () => lease.release() };
+  const effectiveId = registeredId ?? lease.sessionId;
+  if (seedStorage !== undefined) {
+    const session = sessions.get(effectiveId) as {
+      url?: string;
+      setPreconditionFailure?(reason: string): void;
+    } | undefined;
+    if (session?.setPreconditionFailure !== undefined) {
+      const failureReason = evaluateSeedPrecondition(
+        url,
+        session.url,
+        seedStorage,
+        lease.navStatus,
+      );
+      if (failureReason !== undefined) {
+        session.setPreconditionFailure(failureReason);
+      }
+    }
+  }
+  return { sessionId: effectiveId, release: () => lease.release() };
 }
 
 export async function waitForLeasedSession(
@@ -352,8 +485,12 @@ export const LEASE_ACQUIRE_TOOL: ToolDef = {
     if (seedStorageArg !== undefined) {
       const parsed = SeedStorageSchema.safeParse(seedStorageArg);
       if (!parsed.success) {
+        const issuesMsg = scrubSeedFromError(
+          parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join(', '),
+          seedStorageArg,
+        );
         throw new Error(
-          `reticle_lease{action:"acquire"} seedStorage is invalid: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join(', ')}`,
+          `reticle_lease{action:"acquire"} seedStorage is invalid: ${issuesMsg}`,
         );
       }
       validatedSeed = parsed.data;
@@ -425,12 +562,12 @@ export const LEASE_ACQUIRE_TOOL: ToolDef = {
         });
       } catch (err) {
         if (err instanceof Error && err.message.startsWith('Storage seeding failed')) {
-          throw err;
+          throw new Error(scrubSeedFromError(err.message, validatedSeed));
         }
         // A raw page.goto failure is noisy and leaks the internal URL params — surface a clean,
         // actionable message instead.
         throw new Error(
-          `could not open ${url} — is the app running there? (${cleanNavError(err)})`,
+          `could not open ${url} — is the app running there? (${cleanNavError(err, validatedSeed)})`,
         );
       }
       // Wait for the leased tab's SDK to connect so the returned sessionId is usable right away.
@@ -446,6 +583,19 @@ export const LEASE_ACQUIRE_TOOL: ToolDef = {
       // without this the touches miss, the lease ages out despite continuous activity, and the
       // reaper closes the context mid-flow. See BrowserPool.alias and #157.
       if (registeredId !== undefined) pool.alias(registeredId, lease.sessionId);
+      const effectiveSessionId = registeredId ?? lease.sessionId;
+      const session = deps.sessions.get(effectiveSessionId);
+      if (validatedSeed !== undefined && session !== undefined) {
+        const failureReason = evaluateSeedPrecondition(
+          url,
+          session.url,
+          validatedSeed,
+          lease.navStatus,
+        );
+        if (failureReason !== undefined) {
+          session.setPreconditionFailure?.(failureReason);
+        }
+      }
       // The lease now exists, so any HUD a human is watching has just gone dark. Say so.
       tellWatchers(deps, projectId, AGENT_DRIVING_ELSEWHERE);
       // ready means the SDK dialled in — not that contracts match. Carry the skew warning on acquire

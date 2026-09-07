@@ -120,6 +120,7 @@ export type Launcher = () => Promise<PooledBrowser>;
 export interface Lease {
   readonly sessionId: string;
   readonly url: string;
+  readonly navStatus?: number;
   release(): Promise<void>;
 }
 
@@ -475,8 +476,9 @@ export class BrowserPool {
         seedHandle = seedResult?.handle;
         checkSeedError = seedResult?.checkError;
       }
+      let navRes: unknown;
       try {
-        await page.goto(url, { timeoutMs: this.#navTimeout });
+        navRes = await page.goto(url, { timeoutMs: this.#navTimeout });
         checkSeedError?.();
       } finally {
         if (seedHandle !== undefined) {
@@ -488,6 +490,20 @@ export class BrowserPool {
       // the slot count out of sync (drifting below #active.size, eventually exceeding the cap). If we're
       // no longer the live browser, bail — the catch below closes the context and returns the slot.
       if (this.#browser !== browser) throw new Error('browser crashed during navigation');
+      let navStatus: number | undefined;
+      if (null !== navRes && 'object' === typeof navRes && 'status' in navRes) {
+        const s: unknown = (navRes as { status?: unknown }).status;
+        if ('function' === typeof s) {
+          try {
+            const code: unknown = s.call(navRes);
+            if ('number' === typeof code) navStatus = code;
+          } catch {
+            // ignore
+          }
+        } else if ('number' === typeof s) {
+          navStatus = s;
+        }
+      }
       this.#active.set(sessionId, {
         context,
         page,
@@ -499,6 +515,7 @@ export class BrowserPool {
       return {
         sessionId,
         url,
+        ...(navStatus !== undefined ? { navStatus } : {}),
         release: () => this.#release(sessionId),
       };
     } catch (err) {

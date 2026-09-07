@@ -78,6 +78,11 @@ export interface PredicateSession {
    * Optional: a fake that never throttles simply omits it.
    */
   throttled?(): boolean;
+  /**
+   * Set when a required application precondition (e.g. seedStorage) was not established.
+   * Optional: a fake that never tests preconditions simply omits it.
+   */
+  preconditionFailure?(): string | undefined;
 }
 
 /**
@@ -386,8 +391,12 @@ function annotateThrottledMiss(
   result: EvalResult,
 ): EvalResult {
   if (result.pass) return result;
-  if (true !== session.throttled?.()) return result;
   if (result.inconclusive !== undefined) return result;
+  const preconditionFailure = session.preconditionFailure?.();
+  if (preconditionFailure !== undefined) {
+    return { ...result, inconclusive: preconditionFailure };
+  }
+  if (true !== session.throttled?.()) return result;
   if (failureRestsOnSeeing(predicate)) return result;
   return { ...result, inconclusive: THROTTLED_STARVED_NOTE };
 }

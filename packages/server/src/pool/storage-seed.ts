@@ -1,4 +1,4 @@
-import type { SeedStorage } from '@reticlehq/core';
+import { REDACTED_VALUE, scrubKnownSecrets, type SeedStorage } from '@reticlehq/core';
 import type { InitScriptHandle, PooledContext, PooledCookie, PooledPage } from './browser-pool.js';
 
 export function targetOriginOf(navUrl: string): string | undefined {
@@ -104,7 +104,22 @@ export async function seedStorageInto(
   if (hasCookies && context.addCookies !== undefined) {
     const cookiesToSet = normalizeCookies(seed.cookies, targetUrl);
     if (cookiesToSet.length > 0) {
-      await context.addCookies(cookiesToSet);
+      try {
+        await context.addCookies(cookiesToSet);
+      } catch (err: unknown) {
+        let rawMsg = err instanceof Error ? err.message : String(err);
+        for (const c of cookiesToSet) {
+          if (undefined !== c.value && 'string' === typeof c.value && 0 !== c.value.length) {
+            const escaped = c.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            rawMsg = rawMsg.replace(
+              new RegExp(`(^|[^a-zA-Z0-9])${escaped}(?=$|[^a-zA-Z0-9])`, 'g'),
+              `$1${REDACTED_VALUE}`,
+            );
+          }
+        }
+        rawMsg = scrubKnownSecrets(rawMsg);
+        throw new Error(`Storage seeding failed: cookie injection failed (${rawMsg})`);
+      }
     }
   }
 

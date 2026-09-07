@@ -4,15 +4,20 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { RETICLE_URL_PARAM } from '@reticlehq/core';
+import { RETICLE_URL_PARAM, Verified, VerifiedReason } from '@reticlehq/core';
 import {
   LEASE_TOOLS,
   acquireLeasedSession,
   appendReticleParams,
   cleanNavError,
+  evaluateSeedPrecondition,
   hasOriginLock,
+  scrubSeedFromError,
   waitForLeasedSession,
 } from './lease-tools.js';
+import { assertVerdict } from './assert-verdict.js';
+import { evaluatePredicate, type Predicate, type PredicateSession } from '../events/predicate.js';
+import type { Session } from '../session/session.js';
 import { ReticleTool } from './tool-names.js';
 import type { ToolDeps } from './tool-kit.js';
 import type { BrowserPool, Lease } from '../pool/browser-pool.js';
@@ -724,5 +729,204 @@ describe('reticle_lease with seedStorage', () => {
 
     expect(second['sessionId']).toBeDefined();
     expect(hasOriginLock(origin)).toBe(false);
+  });
+
+  describe('credential redaction & seed precondition semantics', () => {
+    it('scrubSeedFromError redacts raw secret values and known secret patterns', () => {
+      const jwt =
+        'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
+      const customSecret = 'SUPER_SECRET_COOKIE_VAL_123';
+      const seed = {
+        cookies: { session: customSecret },
+        local: { token: 'LOCAL_TOKEN_999' },
+      };
+
+      const errorMsg = `Error: failed to write cookie ${customSecret} with payload ${jwt} and local LOCAL_TOKEN_999`;
+      const scrubbed = scrubSeedFromError(errorMsg, seed);
+
+      expect(scrubbed).not.toContain(customSecret);
+      expect(scrubbed).not.toContain(jwt);
+      expect(scrubbed).not.toContain('LOCAL_TOKEN_999');
+      expect(scrubbed).toContain('[REDACTED]');
+    });
+
+    it('reticle_lease acquire scrubs secret values when cookie injection fails', async () => {
+      const secretToken = 'SECRET_TEST_TOKEN_AB12';
+      const { pool } = fakePool();
+      pool.acquire = () =>
+        Promise.reject(
+          new Error(
+            `Storage seeding failed: cookie injection failed (invalid cookie: ${secretToken})`,
+          ),
+        );
+      const deps = { ...baseDeps, pool } as unknown as ToolDeps;
+
+      try {
+        await tool(ReticleTool.LEASE_ACQUIRE)(deps, {
+          url: 'http://localhost:3000/',
+          seedStorage: { cookies: { auth: secretToken } },
+        });
+        expect.unreachable('should have thrown');
+      } catch (err: unknown) {
+        const msg = (err as Error).message;
+        expect(msg).toContain('Storage seeding failed');
+        expect(msg).not.toContain(secretToken);
+        expect(msg).toContain('[REDACTED]');
+      }
+    });
+
+    it('evaluateSeedPrecondition detects 401/403 status codes', () => {
+      const failure401 = evaluateSeedPrecondition(
+        'http://localhost:3000/dashboard',
+        'http://localhost:3000/dashboard',
+        { cookies: { token: 't' } },
+        401,
+      );
+      expect(failure401).toContain('HTTP 401');
+
+      const failure403 = evaluateSeedPrecondition(
+        'http://localhost:3000/dashboard',
+        'http://localhost:3000/dashboard',
+        { cookies: { token: 't' } },
+        403,
+      );
+      expect(failure403).toContain('HTTP 403');
+    });
+
+    it('evaluateSeedPrecondition detects cross-origin redirects when storage was seeded', () => {
+      const failure = evaluateSeedPrecondition(
+        'http://localhost:3000/app',
+        'https://auth.external.com/login',
+        { local: { key: 'val' } },
+        200,
+      );
+      expect(failure).toContain('cross-origin redirect');
+      expect(failure).toContain('skipped origin-scoped storage injection');
+    });
+
+    it('evaluateSeedPrecondition detects redirect to login endpoint when requested URL was not login', () => {
+      const failure = evaluateSeedPrecondition(
+        'http://localhost:3000/dashboard',
+        'http://localhost:3000/login',
+        { cookies: { auth: 'session' } },
+        200,
+      );
+      expect(failure).toContain('redirected from /dashboard to login page (/login)');
+    });
+
+    it('evaluateSeedPrecondition accepts normal application redirects (e.g. / -> /dashboard)', () => {
+      const ok = evaluateSeedPrecondition(
+        'http://localhost:3000/',
+        'http://localhost:3000/dashboard',
+        { cookies: { auth: 'session' } },
+        200,
+      );
+      expect(ok).toBeUndefined();
+    });
+
+    it('sets precondition failure on session and propagates to assertVerdict as UNKNOWN / INCONCLUSIVE', async () => {
+      let preconditionFailure: string | undefined;
+      const fakeSession = {
+        id: 'lease-test-1',
+        url: 'http://localhost:3000/login', // redirected to login!
+        setPreconditionFailure: (reason: string) => {
+          preconditionFailure = reason;
+        },
+        preconditionFailure: () => preconditionFailure,
+        blindSpots: () => ({}),
+        queryEvents: () => Promise.resolve([]),
+        lostSince: () => false,
+        lastAct: { cursor: () => 0, source: () => undefined },
+        hasCapabilities: true,
+        command: () =>
+          Promise.resolve({ ok: true, result: { matched: false, count: 0, elements: [] } }),
+        eventsSince: () => [],
+        onEvent: () => () => {},
+        elapsed: () => 100,
+      };
+
+      const { pool } = fakePool();
+      const deps = {
+        sessions: {
+          get: () => fakeSession,
+        },
+        pool,
+      } as unknown as ToolDeps;
+
+      // Acquire with seedStorage requested for /dashboard
+      const acquireResult = (await tool(ReticleTool.LEASE_ACQUIRE)(deps, {
+        url: 'http://localhost:3000/dashboard',
+        seedStorage: { cookies: { auth: 'cookie-val' } },
+      })) as { sessionId: string };
+
+      expect(acquireResult.sessionId).toBeDefined();
+      expect(fakeSession.preconditionFailure()).toContain(
+        'redirected from /dashboard to login page (/login)',
+      );
+
+      // Evaluate an assertion on this session that fails
+      const predicate: Predicate = { kind: 'element', query: { text: 'Dashboard Welcome' } };
+      const evalRes = await evaluatePredicate(
+        fakeSession as unknown as PredicateSession,
+        predicate,
+      );
+      expect(evalRes.pass).toBe(false);
+      expect(evalRes.inconclusive).toContain('seeded authentication precondition not established');
+
+      const verdict = await assertVerdict(
+        fakeSession as unknown as Session,
+        predicate,
+        evalRes.pass,
+        evalRes.evidence,
+        0,
+        evalRes.inconclusive,
+      );
+
+      expect(verdict.decision['verified']).toBe(Verified.UNKNOWN);
+      expect(verdict.decision['verifiedReason']).toBe(VerifiedReason.INCONCLUSIVE);
+      expect(verdict.decision['because']).toContain(
+        'seeded authentication precondition not established',
+      );
+    });
+
+    it('genuine workflow failure on authenticated session produces normal FAIL (NO / ASSERTION_FAILED)', async () => {
+      const fakeSession = {
+        id: 'lease-test-2',
+        url: 'http://localhost:3000/dashboard', // stays on dashboard!
+        setPreconditionFailure: () => {},
+        preconditionFailure: () => undefined, // Precondition succeeded
+        blindSpots: () => ({}),
+        queryEvents: () => Promise.resolve([]),
+        lostSince: () => false,
+        lastAct: { cursor: () => 0, source: () => undefined },
+        hasCapabilities: true,
+        command: () =>
+          Promise.resolve({ ok: true, result: { matched: false, count: 0, elements: [] } }),
+        eventsSince: () => [],
+        onEvent: () => () => {},
+        elapsed: () => 100,
+      };
+
+      const predicate: Predicate = { kind: 'element', query: { text: 'Missing Button' } };
+      const evalRes = await evaluatePredicate(
+        fakeSession as unknown as PredicateSession,
+        predicate,
+      );
+      expect(evalRes.pass).toBe(false);
+      expect(evalRes.inconclusive).toBeUndefined();
+
+      const verdict = await assertVerdict(
+        fakeSession as unknown as Session,
+        predicate,
+        evalRes.pass,
+        evalRes.evidence,
+        0,
+        evalRes.inconclusive,
+      );
+
+      expect(verdict.decision['verified']).toBe(Verified.NO);
+      expect(verdict.decision['verifiedReason']).toBe(VerifiedReason.ASSERTION_FAILED);
+      expect(verdict.decision['because']).toBe('the declared consequence did not hold');
+    });
   });
 });

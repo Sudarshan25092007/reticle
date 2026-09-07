@@ -396,5 +396,34 @@ describe('storage-seed', () => {
         seedStorageInto(bareContext, barePage, 'http://localhost:3000/', {}),
       ).resolves.not.toThrow();
     });
+
+    it('redacts raw secret values and known secret shapes if context.addCookies throws', async () => {
+      const { fakePage } = makeFakes();
+      const secretToken = 'SECRET_TEST_TOKEN_XYZ_987';
+      const jwtSecret =
+        'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
+      const failingContext: PooledContext = {
+        newPage: () => Promise.reject(new Error('not implemented')),
+        close: () => Promise.resolve(),
+        addCookies: (cookies) => {
+          throw new Error(
+            `Playwright addCookies rejected cookie value="${cookies[0]?.value}" with jwt="${jwtSecret}"`,
+          );
+        },
+      };
+
+      try {
+        await seedStorageInto(failingContext, fakePage, 'http://localhost:3000/', {
+          cookies: { session_auth: secretToken },
+        });
+        expect.unreachable('should have thrown');
+      } catch (err: unknown) {
+        const msg = (err as Error).message;
+        expect(msg).toContain('Storage seeding failed: cookie injection failed');
+        expect(msg).toContain('[REDACTED]');
+        expect(msg).not.toContain(secretToken);
+        expect(msg).not.toContain(jwtSecret);
+      }
+    });
   });
 });

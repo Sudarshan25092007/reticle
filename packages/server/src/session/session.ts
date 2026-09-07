@@ -177,6 +177,8 @@ export class Session {
   #journalReader: JournalReader | undefined;
   /** What this session has learned by watching its own stream: ambient churn + blind-spot levels. */
   readonly #observed = new ObservedState();
+  /** Set when a required application precondition (e.g. seedStorage) was not established. */
+  #preconditionFailure?: string;
   /**
    * Which document is on screen right now — the one the most recent stamped event was observed under.
    *
@@ -343,6 +345,10 @@ export class Session {
   get currentEditEpoch(): number | undefined {
     return this.#editEpoch;
   }
+
+  /** Seed/auth precondition failure reason, if any. */
+  setPreconditionFailure(reason: string): void { this.#preconditionFailure = reason; }
+  preconditionFailure(): string | undefined { return this.#preconditionFailure; }
 
   /** Re-stamp an incoming event with server-relative time, buffer it, and fan out. */
   pushEvent(event: ReticleEvent, byteSize?: number): void {
