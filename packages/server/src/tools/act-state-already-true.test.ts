@@ -21,7 +21,7 @@ import type { Session, SessionManager } from '../session/session.js';
 
 interface StateSessionOptions {
   initialStore?: Record<string, unknown>;
-  onAct?: () => void;
+  onAct?: (setStore: (s: Record<string, unknown>) => void) => void;
   settled?: boolean;
   stateReadOk?: boolean;
 }
@@ -34,13 +34,16 @@ function createStateSession(options: StateSessionOptions = {}) {
     stateReadOk = true,
   } = options;
 
-  const commandLog: { command: string; args: unknown }[] = [];
+  const commandLog: { command: string; args: unknown; result?: unknown }[] = [];
   let currentStore = { ...initialStore };
+  const setStore = (s: Record<string, unknown>) => {
+    currentStore = s;
+  };
 
   const command = (name: string, args: unknown): Promise<CommandResult> => {
-    commandLog.push({ command: name, args });
     if (name === ReticleCommand.STATE_READ) {
       if (!stateReadOk) {
+        commandLog.push({ command: name, args, result: { ok: false } });
         return Promise.resolve({
           kind: 'command_result',
           id: 'sr_err',
@@ -55,41 +58,48 @@ function createStateSession(options: StateSessionOptions = {}) {
         const path = recordArgs['path'] as string;
         const store = currentStore[storeName] as Record<string, unknown> | undefined;
         const found = store !== undefined && path in store;
+        const result = {
+          found,
+          value: found ? store[path] : undefined,
+          storeNames: Object.keys(currentStore),
+        };
+        commandLog.push({ command: name, args, result });
         return Promise.resolve({
           kind: 'command_result',
           id: 'sr_scoped',
           ok: true,
-          result: {
-            found,
-            value: found ? store[path] : undefined,
-            storeNames: Object.keys(currentStore),
-          },
+          result,
         });
       }
+      const result = {
+        stores: { ...currentStore },
+      };
+      commandLog.push({ command: name, args, result });
       return Promise.resolve({
         kind: 'command_result',
         id: 'sr',
         ok: true,
-        result: {
-          stores: currentStore,
-        },
+        result,
       });
     }
 
     if (name === ReticleCommand.ACT) {
-      onAct?.();
+      onAct?.(setStore);
+      const result = {
+        dispatched: true,
+        settled,
+        effect: { domMutatedWithin: 1 },
+      };
+      commandLog.push({ command: name, args, result });
       return Promise.resolve({
         kind: 'command_result',
         id: 'act',
         ok: true,
-        result: {
-          dispatched: true,
-          settled,
-          effect: { domMutatedWithin: 1 },
-        },
+        result,
       });
     }
 
+    commandLog.push({ command: name, args });
     return Promise.resolve({
       kind: 'command_result',
       id: 'other',
@@ -141,9 +151,7 @@ function createStateSession(options: StateSessionOptions = {}) {
     session,
     deps,
     commandLog,
-    setStore: (s: Record<string, unknown>) => {
-      currentStore = s;
-    },
+    setStore,
   };
 }
 
@@ -205,19 +213,20 @@ describe('#864 — pre-existing STATE bypasses alreadyTrue in act_and_wait', () 
     expect(res['verified']).toBe(Verified.NO_FAULT);
     expect(res['verifiedReason']).toBe(VerifiedReason.ALREADY_TRUE);
 
-    const firstStateRead = commandLog.find((c) => c.command === ReticleCommand.STATE_READ);
+    const firstStateReadIndex = commandLog.findIndex(
+      (c) => c.command === ReticleCommand.STATE_READ,
+    );
     const actIndex = commandLog.findIndex((c) => c.command === ReticleCommand.ACT);
-    expect(firstStateRead).toBeDefined();
-    expect(commandLog.indexOf(firstStateRead!)).toBeLessThan(actIndex);
+    expect(firstStateReadIndex).toBeGreaterThanOrEqual(0);
+    expect(firstStateReadIndex).toBeLessThan(actIndex);
   });
 
   it('awards causal YES when STATE was not already true and changed because of the action', async () => {
-    let ctx: ReturnType<typeof createStateSession>;
-    ctx = createStateSession({
+    const ctx = createStateSession({
       initialStore: { app: { cart: { count: 0 } }, cart: { count: 0 } },
-      onAct: () => {
+      onAct: (setStore) => {
         // Action causes cart.count to become 3
-        ctx.setStore({ app: { cart: { count: 3 } }, cart: { count: 3 } });
+        setStore({ app: { cart: { count: 3 } }, cart: { count: 3 } });
       },
       settled: true,
     });
@@ -238,8 +247,25 @@ describe('#864 — pre-existing STATE bypasses alreadyTrue in act_and_wait', () 
 
     // Pre-dispatch STATE_READ saw count: 0 -> alreadyTrue was false
     // Post-dispatch STATE_READ saw count: 3 -> pass was true
-    const stateReads = ctx.commandLog.filter((c) => c.command === ReticleCommand.STATE_READ);
-    expect(stateReads.length).toBeGreaterThanOrEqual(2);
+    const actIndex = ctx.commandLog.findIndex((c) => c.command === ReticleCommand.ACT);
+    expect(actIndex).toBeGreaterThanOrEqual(0);
+
+    const preActRead = ctx.commandLog
+      .slice(0, actIndex)
+      .find((c) => c.command === ReticleCommand.STATE_READ);
+    const postActRead = ctx.commandLog
+      .slice(actIndex + 1)
+      .find((c) => c.command === ReticleCommand.STATE_READ);
+
+    expect(preActRead).toBeDefined();
+    const preStores = (preActRead?.result as { stores?: Record<string, unknown> })?.stores;
+    const preCart = (preStores?.['app'] as { cart?: { count?: number } })?.cart;
+    expect(preCart?.count).toBe(0);
+
+    expect(postActRead).toBeDefined();
+    const postStores = (postActRead?.result as { stores?: Record<string, unknown> })?.stores;
+    const postCart = (postStores?.['app'] as { cart?: { count?: number } })?.cart;
+    expect(postCart?.count).toBe(3);
   });
 
   it('preserves UNKNOWN when pre-existing STATE is true but the window never settled', async () => {

@@ -54,6 +54,3 @@ export function readsDomState(predicate: Predicate): boolean {
       return false;
   }
 }
-
-/** Alias reflecting that this checks live state (DOM, route fallback, and application store). */
-export const readsLiveState = readsDomState;

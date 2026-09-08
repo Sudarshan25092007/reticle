@@ -130,9 +130,7 @@ describe('which predicates need the before-check at all', () => {
     expect(readsDomState({ kind: 'not', predicate: { kind: 'text', contains: 'Error' } })).toBe(
       true,
     );
-    expect(readsDomState({ kind: 'not', predicate: { kind: 'state', path: 'error' } })).toBe(
-      true,
-    );
+    expect(readsDomState({ kind: 'not', predicate: { kind: 'state', path: 'error' } })).toBe(true);
     expect(readsDomState({ kind: 'anyOf', predicates: [{ kind: 'signal', name: 'a' }] })).toBe(
       false,
     );
